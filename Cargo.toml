@@ -1,0 +1,16 @@
+[package]
+name = "v"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glfw = { version = "0.51", features = ["vulkan", "log"]}
+ash = "0.37"
+ezlogger = "0.1"
+log = "0.4"
+syn = "2.0"
+
+[lib]
+name = "macros"
+path = "macros/lib.rs"
+proc-macro = true
