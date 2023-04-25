@@ -10,6 +10,13 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const FRAMES_IN_FLIGHT: u32 = 2;
+const EXTENSIONS: &[&str] = &[
+  #[cfg(debug_assertions)]
+  "VK_EXT_debug_utils",
+  #[cfg(target_os = "macos")]
+  "VK_KHR_portability_enumeration",
+];
+const LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 
 fn main() -> Result {
   ezlogger::init(LevelFilter::Trace)?;
@@ -22,43 +29,42 @@ fn main() -> Result {
   unsafe {
     let entry = Entry::load()?;
     let mut extensions = glfw.get_required_instance_extensions().unwrap();
-    extensions.push("VK_EXT_debug_utils".to_string());
-    extensions.push("VK_KHR_portability_enumeration".to_string());
+    extensions.extend(EXTENSIONS.iter().map(|s| String::from(*s)));
     debug!("extensions: {:?}", extensions);
-    let mut debug_utils_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
-      .message_severity(
-        // vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-        // | vk::DebugUtilsMessageSeverityFlagsEXT::INFO |
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING | {
-          vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-        },
+    let instance_info = vk::InstanceCreateInfo::builder()
+      .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
+      .application_info(
+        &vk::ApplicationInfo::builder()
+          .application_name(&CString::new(env!("CARGO_PKG_NAME"))?)
+          .api_version(vk::API_VERSION_1_3),
       )
-      .message_type(
-        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-          | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-          | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-      )
-      .pfn_user_callback(Some(debug_callback));
-    let layers = vec![
-      "VK_LAYER_KHRONOS_validation",
-      // "VK_LAYER_RENDERDOC_Capture",
-    ];
-    debug!("validation layers: {:?}", layers);
-    let instance = entry.create_instance(
-      &vk::InstanceCreateInfo::builder()
-        .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
-        .application_info(
-          &vk::ApplicationInfo::builder()
-            .application_name(&CString::new(env!("CARGO_PKG_NAME"))?)
-            .api_version(vk::API_VERSION_1_3),
+      .enabled_extension_names(&cstr_vec(extensions.as_ref()));
+    let instance = if cfg!(debug_assertions) {
+      let mut debug_utils_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+        .message_severity(
+          vk::DebugUtilsMessageSeverityFlagsEXT::WARNING | {
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+          },
         )
-        .enabled_extension_names(&cstr_vec(extensions))
-        .enabled_layer_names(&cstr_vec(layers))
-        .push_next(&mut debug_utils_info),
-      None,
-    )?;
-    let debug_utils = ext::DebugUtils::new(&entry, &instance);
-    debug_utils.create_debug_utils_messenger(&debug_utils_info, None)?;
+        .message_type(
+          vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        )
+        .pfn_user_callback(Some(debug_callback));
+      debug!("validation layers: {:?}", LAYERS);
+      let instance = entry.create_instance(
+        &instance_info
+          .enabled_layer_names(&cstr_vec(LAYERS))
+          .push_next(&mut debug_utils_info),
+        None,
+      )?;
+      let debug_utils = ext::DebugUtils::new(&entry, &instance);
+      debug_utils.create_debug_utils_messenger(&debug_utils_info, None)?;
+      instance
+    } else {
+      entry.create_instance(&instance_info, None)?
+    };
 
     let surface_ext = khr::Surface::new(&entry, &instance);
     let mut surface = vk::SurfaceKHR::null();
@@ -80,7 +86,7 @@ fn main() -> Result {
         .queue_create_infos(&[*vk::DeviceQueueCreateInfo::builder()
           .queue_family_index(0)
           .queue_priorities(&[1.0])])
-        .enabled_extension_names(&cstr_vec(device_extensions)),
+        .enabled_extension_names(&cstr_vec(&device_extensions)),
       None,
     )?;
     let queue = device.get_device_queue(0, 0);
@@ -391,9 +397,9 @@ unsafe fn create_swapchain(
   Ok((swapchain, swapchain_image_views, framebuffers))
 }
 
-fn cstr_vec<S: Into<Vec<u8>>>(v: Vec<S>) -> Vec<*const c_char> {
+fn cstr_vec(v: &[&str]) -> Vec<*const c_char> {
   v.into_iter()
-    .map(|s| CString::new(s).unwrap().into_raw() as _)
+    .map(|s| CString::new(*s).unwrap().into_raw() as _)
     .collect::<Vec<_>>()
 }
 
