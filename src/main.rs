@@ -5,8 +5,7 @@ use std::ffi::{CString, CStr, c_void, c_char};
 use ash::{Entry, Instance, Device, vk};
 use ash::extensions::{ext, khr};
 use glfw::{WindowMode, WindowHint, ClientApiHint};
-use glam::{Vec3, Mat4};
-use gltf::Gltf;
+use glam::{Vec3, Vec2, Mat4};
 use log::{LevelFilter, Level, debug, log};
 use macros::include_glsl;
 
@@ -14,13 +13,13 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const FRAMES_IN_FLIGHT: u32 = 2;
-const EXTENSIONS: [&str; 2] = [
+const EXTENSIONS: [&str; 1] = [
   #[cfg(debug_assertions)]
   "VK_EXT_debug_utils",
   #[cfg(target_os = "macos")]
   "VK_KHR_portability_enumeration",
 ];
-const DEVICE_EXTENSIONS: [&str; 2] = [
+const DEVICE_EXTENSIONS: [&str; 1] = [
   "VK_KHR_swapchain",
   #[cfg(target_os = "macos")]
   "VK_KHR_portability_subset",
@@ -34,7 +33,7 @@ const LAYERS: [&str; 1] = [
 #[derive(Copy, Clone)]
 struct Vertex {
   pos: Vec3,
-  color: Vec3,
+  uv: Vec2,
 }
 
 #[repr(C)]
@@ -62,10 +61,83 @@ impl Vertex {
       *vk::VertexInputAttributeDescription::builder()
         .binding(0)
         .location(1)
-        .format(vk::Format::R32G32B32_SFLOAT)
+        .format(vk::Format::R32G32_SFLOAT)
         .offset(mem::size_of::<Vec3>() as _),
     ]
   }
+}
+
+unsafe fn get_memory_type(
+  instance: &Instance,
+  phys_device: vk::PhysicalDevice,
+  props: vk::MemoryPropertyFlags,
+) -> u32 {
+  instance
+    .get_physical_device_memory_properties(phys_device)
+    .memory_types
+    .iter()
+    .position(|t| t.property_flags.contains(props))
+    .expect("could not find suitable memory") as _
+}
+
+unsafe fn exec_command_buffer<F: Fn(vk::CommandBuffer)>(
+  device: &Device,
+  queue: vk::Queue,
+  command_pool: vk::CommandPool,
+  f: F,
+) -> Result {
+  let command_buffer = device.allocate_command_buffers(
+    &vk::CommandBufferAllocateInfo::builder()
+      .level(vk::CommandBufferLevel::PRIMARY)
+      .command_pool(command_pool)
+      .command_buffer_count(1),
+  )?[0];
+  device.begin_command_buffer(
+    command_buffer,
+    &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+  )?;
+  f(command_buffer);
+  device.end_command_buffer(command_buffer)?;
+  device.queue_submit(
+    queue,
+    &[*vk::SubmitInfo::builder().command_buffers(&[command_buffer])],
+    vk::Fence::null(),
+  )?;
+  device.queue_wait_idle(queue)?;
+  device.free_command_buffers(command_pool, &[command_buffer]);
+  Ok(())
+}
+
+// todo make image wrapper
+unsafe fn transition_image(
+  device: &Device,
+  command_buffer: vk::CommandBuffer,
+  image: vk::Image,
+  old: vk::ImageLayout,
+  new: vk::ImageLayout,
+) {
+  device.cmd_pipeline_barrier(
+    command_buffer,
+    vk::PipelineStageFlags::empty(),
+    vk::PipelineStageFlags::empty(),
+    vk::DependencyFlags::empty(),
+    &[],
+    &[],
+    &[*vk::ImageMemoryBarrier::builder()
+      .old_layout(old)
+      .new_layout(new)
+      .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+      .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+      .image(image)
+      .subresource_range(
+        *vk::ImageSubresourceRange::builder()
+          .aspect_mask(vk::ImageAspectFlags::COLOR)
+          .base_mip_level(0)
+          .level_count(1)
+          .base_array_layer(0)
+          .layer_count(1),
+      )],
+  );
 }
 
 // todo drop
@@ -73,6 +145,7 @@ struct Buffer<T, P = ()> {
   buf: vk::Buffer,
   mem: vk::DeviceMemory,
   ptr: P,
+  len: usize,
   t: PhantomData<T>,
 }
 
@@ -83,8 +156,9 @@ impl<T> Buffer<T, ()> {
     phys_device: vk::PhysicalDevice,
     usage: vk::BufferUsageFlags,
     mem_props: vk::MemoryPropertyFlags,
+    len: usize,
   ) -> Result<Self> {
-    let size = mem::size_of::<T>() as _;
+    let size = (len * mem::size_of::<T>()) as _;
     let buf = device.create_buffer(
       &vk::BufferCreateInfo::builder()
         .size(size)
@@ -92,23 +166,17 @@ impl<T> Buffer<T, ()> {
         .sharing_mode(vk::SharingMode::EXCLUSIVE),
       None,
     )?;
-    let memory_type = instance
-      .get_physical_device_memory_properties(phys_device)
-      .memory_types
-      .iter()
-      .enumerate()
-      .find_map(|(i, t)| t.property_flags.contains(mem_props).then_some(i))
-      .expect("could not find suitable memory");
     let mem = device.allocate_memory(
       &vk::MemoryAllocateInfo::builder()
-        .allocation_size(size)
-        .memory_type_index(memory_type as _),
+        .allocation_size(device.get_buffer_memory_requirements(buf).size)
+        .memory_type_index(get_memory_type(instance, phys_device, mem_props)),
       None,
     )?;
     device.bind_buffer_memory(buf, mem, 0)?;
     Ok(Self {
       buf,
       mem,
+      len,
       ptr: (),
       t: PhantomData,
     })
@@ -118,25 +186,27 @@ impl<T> Buffer<T, ()> {
     Ok(Buffer {
       buf: self.buf,
       mem: self.mem,
+      len: self.len,
       ptr: device.map_memory(
         self.mem,
         0,
-        mem::size_of::<T>() as _,
+        (self.len * mem::size_of::<T>()) as _,
         vk::MemoryMapFlags::empty(),
       )? as _,
       t: PhantomData,
     })
   }
 
-  unsafe fn write(&self, device: &Device, data: T) -> Result {
-    ptr::replace(
+  unsafe fn write(&self, device: &Device, data: &[T]) -> Result {
+    ptr::copy(
+      data.as_ptr(),
       device.map_memory(
         self.mem,
         0,
-        mem::size_of::<T>() as _,
+        (data.len() * mem::size_of::<T>()) as _,
         vk::MemoryMapFlags::empty(),
       )? as _,
-      data,
+      data.len(),
     );
     device.unmap_memory(self.mem);
     Ok(())
@@ -149,30 +219,14 @@ impl<T> Buffer<T, ()> {
     command_pool: vk::CommandPool,
     other: &Self,
   ) -> Result {
-    let command_buffer = device.allocate_command_buffers(
-      &vk::CommandBufferAllocateInfo::builder()
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_pool(command_pool)
-        .command_buffer_count(1),
-    )?[0];
-    device.begin_command_buffer(
-      command_buffer,
-      &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-    )?;
-    device.cmd_copy_buffer(
-      command_buffer,
-      self.buf,
-      other.buf,
-      &[*vk::BufferCopy::builder().size(mem::size_of::<T>() as _)],
-    );
-    device.end_command_buffer(command_buffer)?;
-    device.queue_submit(
-      queue,
-      &[*vk::SubmitInfo::builder().command_buffers(&[command_buffer])],
-      vk::Fence::null(),
-    )?;
-    device.queue_wait_idle(queue)?;
-    device.free_command_buffers(command_pool, &[command_buffer]);
+    exec_command_buffer(device, queue, command_pool, |command_buffer| {
+      device.cmd_copy_buffer(
+        command_buffer,
+        self.buf,
+        other.buf,
+        &[*vk::BufferCopy::builder().size((self.len * mem::size_of::<T>()) as _)],
+      );
+    })?;
     Ok(())
   }
 
@@ -183,7 +237,7 @@ impl<T> Buffer<T, ()> {
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     usage: vk::BufferUsageFlags,
-    data: T,
+    data: &[T],
   ) -> Result<Self> {
     let staging = Self::new(
       instance,
@@ -191,6 +245,7 @@ impl<T> Buffer<T, ()> {
       phys_device,
       vk::BufferUsageFlags::TRANSFER_SRC,
       vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+      data.len(),
     )?;
     staging.write(device, data)?;
     let buf = Self::new(
@@ -199,6 +254,7 @@ impl<T> Buffer<T, ()> {
       phys_device,
       usage | vk::BufferUsageFlags::TRANSFER_DST,
       vk::MemoryPropertyFlags::DEVICE_LOCAL,
+      data.len(),
     )?;
     staging.copy(device, queue, command_pool, &buf)?;
     Ok(buf)
@@ -206,8 +262,8 @@ impl<T> Buffer<T, ()> {
 }
 
 impl<T> Buffer<T, *mut T> {
-  unsafe fn write(&self, data: T) {
-    ptr::replace(self.ptr, data);
+  unsafe fn write(&self, data: &[T]) {
+    ptr::copy(data.as_ptr(), self.ptr, data.len());
   }
 }
 
@@ -241,7 +297,11 @@ fn main() -> Result {
       .application_name(&app_name)
       .api_version(vk::API_VERSION_1_3);
     let instance_info = vk::InstanceCreateInfo::builder()
-      .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
+      .flags(if cfg!(target_os = "macos") {
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+      } else {
+        vk::InstanceCreateFlags::empty()
+      })
       .application_info(&app_info)
       .enabled_extension_names(&extensions);
     let instance = if cfg!(debug_assertions) {
@@ -447,6 +507,7 @@ fn main() -> Result {
           phys_device,
           vk::BufferUsageFlags::UNIFORM_BUFFER,
           vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+          1,
         )
         .unwrap()
         .map(&device)
@@ -483,29 +544,21 @@ fn main() -> Result {
       })
       .collect();
 
-    let gltf = gltf::Gltf::open("Box.gltf")?;
-    for mesh in gltf.meshes() {
-      debug!("{:?}", mesh);
-    }
-    let vertices = [
-      Vertex {
-        pos: Vec3::new(-0.5, -0.5, 0.0),
-        color: Vec3::X,
-      },
-      Vertex {
-        pos: Vec3::new(0.5, -0.5, 0.0),
-        color: Vec3::Z,
-      },
-      Vertex {
-        pos: Vec3::new(0.5, 0.5, 0.0),
-        color: Vec3::X,
-      },
-      Vertex {
-        pos: Vec3::new(-0.5, 0.5, 0.0),
-        color: Vec3::Y,
-      },
-    ];
-    let indices = [0u16, 1, 2, 2, 3, 0];
+    let (doc, buffers, images) = gltf::import("box.glb")?;
+    let mesh = doc.meshes().next().unwrap();
+    let primitive = mesh.primitives().next().unwrap();
+    let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+    let vertices: Vec<_> = reader
+      .read_positions()
+      .unwrap()
+      .zip(reader.read_tex_coords(0).unwrap().into_f32())
+      .map(|(p, u)| Vertex {
+        pos: p.into(),
+        uv: u.into(),
+      })
+      .collect();
+    let indices: Vec<_> = reader.read_indices().unwrap().into_u32().collect();
+
     let vertex_buffer = Buffer::new_with_staging(
       &instance,
       &device,
@@ -513,7 +566,7 @@ fn main() -> Result {
       queue,
       command_pool,
       vk::BufferUsageFlags::VERTEX_BUFFER,
-      vertices,
+      &vertices,
     )?;
     let index_buffer = Buffer::new_with_staging(
       &instance,
@@ -522,8 +575,94 @@ fn main() -> Result {
       queue,
       command_pool,
       vk::BufferUsageFlags::INDEX_BUFFER,
-      indices,
+      &indices,
     )?;
+
+    let image_format = vk::Format::R8G8B8A8_SRGB;
+    let image_data = &images[primitive
+      .material()
+      .pbr_metallic_roughness()
+      .base_color_texture()
+      .unwrap()
+      .texture()
+      .source()
+      .index()];
+
+    // make it rgba it will fix buffer copy
+    let image_staging = Buffer::new(
+      &instance,
+      &device,
+      phys_device,
+      vk::BufferUsageFlags::TRANSFER_SRC,
+      vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+      image_data.pixels.len(),
+    )?;
+    image_staging.write(&device, &image_data.pixels)?;
+    let image_extent = vk::Extent3D {
+      width: image_data.width,
+      height: image_data.height,
+      depth: 1,
+    };
+    let image = device.create_image(
+      &vk::ImageCreateInfo::builder()
+        .image_type(vk::ImageType::TYPE_2D)
+        .extent(image_extent)
+        .mip_levels(1)
+        .array_layers(1)
+        .format(image_format)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .samples(vk::SampleCountFlags::TYPE_1),
+      None,
+    )?;
+    let image_memory = device.allocate_memory(
+      &vk::MemoryAllocateInfo::builder()
+        .allocation_size(device.get_image_memory_requirements(image).size)
+        .memory_type_index(get_memory_type(
+          &instance,
+          phys_device,
+          vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )),
+      None,
+    )?;
+    device.bind_image_memory(image, image_memory, 0)?;
+    exec_command_buffer(&device, queue, command_pool, |command_buffer| {
+      transition_image(
+        &device,
+        command_buffer,
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+      );
+      device.cmd_copy_buffer_to_image(
+        command_buffer,
+        image_staging.buf,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &[*vk::BufferImageCopy::builder()
+          .buffer_offset(0)
+          .buffer_row_length(0)
+          .buffer_image_height(0)
+          .image_subresource(
+            *vk::ImageSubresourceLayers::builder()
+              .aspect_mask(vk::ImageAspectFlags::COLOR)
+              .mip_level(0)
+              .base_array_layer(0)
+              .layer_count(1),
+          )
+          .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+          .image_extent(image_extent)],
+      );
+      transition_image(
+        &device,
+        command_buffer,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+      );
+    })?;
 
     let mut frame: u32 = 0;
     while !window.should_close() {
@@ -592,9 +731,9 @@ fn main() -> Result {
         pipeline,
       );
 
-      resources.uniform_buffer.write(UniformBuffer {
-        model: Mat4::IDENTITY,
-        view: Mat4::look_at_rh(Vec3::new(2.0, 2.0, 2.0), Vec3::new(0.0, 0.0, 0.0), Vec3::Z),
+      resources.uniform_buffer.write(&[UniformBuffer {
+        model: Mat4::from_rotation_y(glfw.get_time() as _),
+        view: Mat4::look_at_rh(Vec3::new(2.0, 2.0, 2.0), Vec3::new(0.0, 0.0, 0.0), Vec3::Y),
         proj: Mat4::perspective_rh(
           50.0f32.to_radians(),
           surface_capabilities.current_extent.width as f32
@@ -602,13 +741,13 @@ fn main() -> Result {
           0.1,
           100.0,
         ),
-      });
+      }]);
       device.cmd_bind_vertex_buffers(resources.command_buffer, 0, &[vertex_buffer.buf], &[0]);
       device.cmd_bind_index_buffer(
         resources.command_buffer,
         index_buffer.buf,
         0,
-        vk::IndexType::UINT16,
+        vk::IndexType::UINT32,
       );
       device.cmd_bind_descriptor_sets(
         resources.command_buffer,
@@ -741,7 +880,7 @@ unsafe fn create_swapchain(
 }
 
 fn cstr_vec(v: &[&str]) -> Vec<*const c_char> {
-  v.into_iter()
+  v.iter()
     .map(|s| CString::new(*s).unwrap().into_raw() as _)
     .collect::<Vec<_>>()
 }
