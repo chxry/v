@@ -9,6 +9,8 @@ ash = "0.37"
 ezlogger = "0.1"
 log = "0.4"
 syn = "2.0"
+glam = "0.24"
+gltf = "1.0"
 
 [lib]
 name = "macros"
