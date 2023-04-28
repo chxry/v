@@ -1,4 +1,4 @@
-#![feature(generic_arg_infer)]
+#![feature(generic_arg_infer, type_name_of_val)]
 use std::{ptr, mem};
 use std::marker::PhantomData;
 use std::ffi::{CString, CStr, c_void, c_char};
@@ -13,13 +13,13 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const FRAMES_IN_FLIGHT: u32 = 2;
-const EXTENSIONS: [&str; 1] = [
+const EXTENSIONS: [&str; 2] = [
   #[cfg(debug_assertions)]
   "VK_EXT_debug_utils",
   #[cfg(target_os = "macos")]
   "VK_KHR_portability_enumeration",
 ];
-const DEVICE_EXTENSIONS: [&str; 1] = [
+const DEVICE_EXTENSIONS: [&str; 2] = [
   "VK_KHR_swapchain",
   #[cfg(target_os = "macos")]
   "VK_KHR_portability_subset",
@@ -116,10 +116,29 @@ unsafe fn transition_image(
   old: vk::ImageLayout,
   new: vk::ImageLayout,
 ) {
+  let (old_mask, old_stage) = if old == vk::ImageLayout::TRANSFER_DST_OPTIMAL {
+    (
+      vk::AccessFlags::TRANSFER_WRITE,
+      vk::PipelineStageFlags::TRANSFER,
+    )
+  } else {
+    (vk::AccessFlags::NONE, vk::PipelineStageFlags::TOP_OF_PIPE)
+  };
+  let (new_mask, new_stage) = if new == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+    (
+      vk::AccessFlags::SHADER_READ,
+      vk::PipelineStageFlags::FRAGMENT_SHADER,
+    )
+  } else {
+    (
+      vk::AccessFlags::TRANSFER_WRITE,
+      vk::PipelineStageFlags::TRANSFER,
+    )
+  };
   device.cmd_pipeline_barrier(
     command_buffer,
-    vk::PipelineStageFlags::empty(),
-    vk::PipelineStageFlags::empty(),
+    old_stage,
+    new_stage,
     vk::DependencyFlags::empty(),
     &[],
     &[],
@@ -128,6 +147,8 @@ unsafe fn transition_image(
       .new_layout(new)
       .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
       .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+      .src_access_mask(old_mask)
+      .dst_access_mask(new_mask)
       .image(image)
       .subresource_range(
         *vk::ImageSubresourceRange::builder()
@@ -269,7 +290,7 @@ impl<T> Buffer<T, *mut T> {
 
 struct FrameResources {
   command_buffer: vk::CommandBuffer,
-  descriptor_set: vk::DescriptorSet,
+  descriptor_sets: [vk::DescriptorSet; 2],
   image_availible: vk::Semaphore,
   render_finished: vk::Semaphore,
   in_flight: vk::Fence,
@@ -374,25 +395,50 @@ fn main() -> Result {
       .name(&main);
     let render_pass = device.create_render_pass(
       &vk::RenderPassCreateInfo::builder()
-        .attachments(&[*vk::AttachmentDescription::builder()
-          .format(SWAPCHAIN_FORMAT)
-          .samples(vk::SampleCountFlags::TYPE_1)
-          .load_op(vk::AttachmentLoadOp::CLEAR)
-          .store_op(vk::AttachmentStoreOp::STORE)
-          .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-          .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-          .initial_layout(vk::ImageLayout::UNDEFINED)
-          .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)])
+        .attachments(&[
+          *vk::AttachmentDescription::builder()
+            .format(SWAPCHAIN_FORMAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+          *vk::AttachmentDescription::builder()
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ])
         .subpasses(&[*vk::SubpassDescription::builder()
           .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
           .color_attachments(&[*vk::AttachmentReference::builder()
             .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)])])
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)])
+          .depth_stencil_attachment(
+            &vk::AttachmentReference::builder()
+              .attachment(1)
+              .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+          )])
         .dependencies(&[*vk::SubpassDependency::builder()
           .src_subpass(vk::SUBPASS_EXTERNAL)
-          .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-          .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-          .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)]),
+          .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+              | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+          )
+          .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+              | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+          )
+          .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+              | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+          )]),
       None,
     )?;
     let descriptor_set_layout = device.create_descriptor_set_layout(
@@ -402,6 +448,11 @@ fn main() -> Result {
           .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
           .descriptor_count(1)
           .stage_flags(vk::ShaderStageFlags::VERTEX),
+        *vk::DescriptorSetLayoutBinding::builder()
+          .binding(1)
+          .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+          .descriptor_count(1)
+          .stage_flags(vk::ShaderStageFlags::FRAGMENT),
       ]),
       None,
     )?;
@@ -434,7 +485,7 @@ fn main() -> Result {
               .depth_bias_enable(false)
               .polygon_mode(vk::PolygonMode::FILL)
               .line_width(1.0)
-              .cull_mode(vk::CullModeFlags::BACK)
+              .cull_mode(vk::CullModeFlags::NONE) // back
               .front_face(vk::FrontFace::CLOCKWISE),
           )
           .multisample_state(
@@ -453,6 +504,12 @@ fn main() -> Result {
             &vk::PipelineDynamicStateCreateInfo::builder()
               .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]),
           )
+          .depth_stencil_state(
+            &vk::PipelineDepthStencilStateCreateInfo::builder()
+              .depth_test_enable(true)
+              .depth_write_enable(true)
+              .depth_compare_op(vk::CompareOp::LESS),
+          )
           .layout(pipeline_layout)
           .render_pass(render_pass)
           .subpass(0)],
@@ -464,7 +521,9 @@ fn main() -> Result {
     let mut surface_capabilities =
       surface_ext.get_physical_device_surface_capabilities(phys_device, surface)?;
     let (mut swapchain, mut swapchain_image_views, mut framebuffers) = create_swapchain(
+      &instance,
       &device,
+      phys_device,
       &swapchain_ext,
       surface,
       render_pass,
@@ -486,9 +545,14 @@ fn main() -> Result {
     let descriptor_pool = device.create_descriptor_pool(
       &vk::DescriptorPoolCreateInfo::builder()
         .max_sets(FRAMES_IN_FLIGHT)
-        .pool_sizes(&[*vk::DescriptorPoolSize::builder()
-          .descriptor_count(FRAMES_IN_FLIGHT)
-          .ty(vk::DescriptorType::UNIFORM_BUFFER)]),
+        .pool_sizes(&[
+          *vk::DescriptorPoolSize::builder()
+            .descriptor_count(FRAMES_IN_FLIGHT)
+            .ty(vk::DescriptorType::UNIFORM_BUFFER),
+          *vk::DescriptorPoolSize::builder()
+            .descriptor_count(FRAMES_IN_FLIGHT)
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        ]),
       None,
     )?;
     let descriptor_sets = device.allocate_descriptor_sets(
@@ -497,55 +561,8 @@ fn main() -> Result {
         .set_layouts(&[descriptor_set_layout; FRAMES_IN_FLIGHT as _]),
     )?;
 
-    let resources: Vec<_> = command_buffers
-      .into_iter()
-      .zip(descriptor_sets)
-      .map(|(b, d)| {
-        let uniform_buffer = Buffer::new(
-          &instance,
-          &device,
-          phys_device,
-          vk::BufferUsageFlags::UNIFORM_BUFFER,
-          vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-          1,
-        )
-        .unwrap()
-        .map(&device)
-        .unwrap();
-        device.update_descriptor_sets(
-          &[*vk::WriteDescriptorSet::builder()
-            .dst_set(d)
-            .dst_binding(0)
-            .dst_array_element(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&[*vk::DescriptorBufferInfo::builder()
-              .buffer(uniform_buffer.buf)
-              .offset(0)
-              .range(mem::size_of::<UniformBuffer>() as _)])],
-          &[],
-        );
-        FrameResources {
-          command_buffer: b,
-          descriptor_set: d,
-          image_availible: device
-            .create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)
-            .unwrap(),
-          render_finished: device
-            .create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)
-            .unwrap(),
-          in_flight: device
-            .create_fence(
-              &vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED),
-              None,
-            )
-            .unwrap(),
-          uniform_buffer,
-        }
-      })
-      .collect();
-
-    let (doc, buffers, images) = gltf::import("box.glb")?;
-    let mesh = doc.meshes().next().unwrap();
+    let (doc, buffers, images) = gltf::import("model.glb")?;
+    let mesh = doc.meshes().nth(1).unwrap();
     let primitive = mesh.primitives().next().unwrap();
     let reader = primitive.reader(|b| Some(&buffers[b.index()]));
     let vertices: Vec<_> = reader
@@ -587,17 +604,21 @@ fn main() -> Result {
       .texture()
       .source()
       .index()];
+    let image_pixels: Vec<_> = image_data
+      .pixels
+      .chunks_exact(3)
+      .flat_map(|a| [a[0], a[1], a[2], 255])
+      .collect();
 
-    // make it rgba it will fix buffer copy
     let image_staging = Buffer::new(
       &instance,
       &device,
       phys_device,
       vk::BufferUsageFlags::TRANSFER_SRC,
       vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-      image_data.pixels.len(),
+      image_pixels.len(),
     )?;
-    image_staging.write(&device, &image_data.pixels)?;
+    image_staging.write(&device, &image_pixels)?;
     let image_extent = vk::Extent3D {
       width: image_data.width,
       height: image_data.height,
@@ -663,6 +684,88 @@ fn main() -> Result {
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
       );
     })?;
+    let image_view = device.create_image_view(
+      &vk::ImageViewCreateInfo::builder()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(image_format)
+        .subresource_range(
+          *vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1),
+        ),
+      None,
+    )?;
+    let image_sampler = device.create_sampler(
+      &vk::SamplerCreateInfo::builder()
+        .min_filter(vk::Filter::LINEAR)
+        .mag_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT),
+      None,
+    )?;
+
+    let resources: Vec<_> = command_buffers
+      .into_iter()
+      .zip(descriptor_sets)
+      .map(|(b, d)| {
+        let uniform_buffer = Buffer::new(
+          &instance,
+          &device,
+          phys_device,
+          vk::BufferUsageFlags::UNIFORM_BUFFER,
+          vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+          1,
+        )
+        .unwrap()
+        .map(&device)
+        .unwrap();
+        device.update_descriptor_sets(
+          &[
+            *vk::WriteDescriptorSet::builder()
+              .dst_set(d)
+              .dst_binding(0)
+              .dst_array_element(0)
+              .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+              .buffer_info(&[*vk::DescriptorBufferInfo::builder()
+                .buffer(uniform_buffer.buf)
+                .offset(0)
+                .range(mem::size_of::<UniformBuffer>() as _)]),
+            *vk::WriteDescriptorSet::builder()
+              .dst_set(d)
+              .dst_binding(1)
+              .dst_array_element(0)
+              .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+              .image_info(&[*vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(image_view)
+                .sampler(image_sampler)]),
+          ],
+          &[],
+        );
+        FrameResources {
+          command_buffer: b,
+          descriptor_sets: [d, d.clone()],
+          image_availible: device
+            .create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)
+            .unwrap(),
+          render_finished: device
+            .create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)
+            .unwrap(),
+          in_flight: device
+            .create_fence(
+              &vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED),
+              None,
+            )
+            .unwrap(),
+          uniform_buffer,
+        }
+      })
+      .collect();
 
     let mut frame: u32 = 0;
     while !window.should_close() {
@@ -697,11 +800,19 @@ fn main() -> Result {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: surface_capabilities.current_extent,
           })
-          .clear_values(&[vk::ClearValue {
-            color: vk::ClearColorValue {
-              float32: [0.0, 0.0, 0.0, 1.0],
+          .clear_values(&[
+            vk::ClearValue {
+              color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+              },
             },
-          }]),
+            vk::ClearValue {
+              depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+              },
+            },
+          ]),
         vk::SubpassContents::INLINE,
       );
 
@@ -732,10 +843,10 @@ fn main() -> Result {
       );
 
       resources.uniform_buffer.write(&[UniformBuffer {
-        model: Mat4::from_rotation_y(glfw.get_time() as _),
-        view: Mat4::look_at_rh(Vec3::new(2.0, 2.0, 2.0), Vec3::new(0.0, 0.0, 0.0), Vec3::Y),
+        model: Mat4::from_rotation_z(glfw.get_time() as _),
+        view: Mat4::look_at_rh(Vec3::new(4.0, 0.0, -2.0), Vec3::new(0.0, 0.0, 0.0), Vec3::Z),
         proj: Mat4::perspective_rh(
-          50.0f32.to_radians(),
+          80.0f32.to_radians(),
           surface_capabilities.current_extent.width as f32
             / surface_capabilities.current_extent.height as f32,
           0.1,
@@ -754,7 +865,7 @@ fn main() -> Result {
         vk::PipelineBindPoint::GRAPHICS,
         pipeline_layout,
         0,
-        &[resources.descriptor_set],
+        &[resources.descriptor_sets[0]],
         &[],
       );
       device.cmd_draw_indexed(resources.command_buffer, indices.len() as _, 1, 0, 0, 0);
@@ -791,7 +902,9 @@ fn main() -> Result {
           surface_capabilities =
             surface_ext.get_physical_device_surface_capabilities(phys_device, surface)?;
           (swapchain, swapchain_image_views, framebuffers) = create_swapchain(
+            &instance,
             &device,
+            phys_device,
             &swapchain_ext,
             surface,
             render_pass,
@@ -809,7 +922,9 @@ fn main() -> Result {
 }
 
 unsafe fn create_swapchain(
+  instance: &Instance,
   device: &Device,
+  phys_device: vk::PhysicalDevice,
   swapchain_ext: &khr::Swapchain,
   surface: vk::SurfaceKHR,
   render_pass: vk::RenderPass,
@@ -817,6 +932,47 @@ unsafe fn create_swapchain(
 ) -> Result<(vk::SwapchainKHR, Vec<vk::ImageView>, Vec<vk::Framebuffer>)> {
   let image_count = surface_capabilities.min_image_count + 1;
   let extent = surface_capabilities.current_extent;
+  // free
+  let depth_image = device.create_image(
+    &vk::ImageCreateInfo::builder()
+      .image_type(vk::ImageType::TYPE_2D)
+      .extent(extent.into())
+      .mip_levels(1)
+      .array_layers(1)
+      .format(vk::Format::D32_SFLOAT)
+      .tiling(vk::ImageTiling::OPTIMAL)
+      .initial_layout(vk::ImageLayout::UNDEFINED)
+      .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+      .sharing_mode(vk::SharingMode::EXCLUSIVE)
+      .samples(vk::SampleCountFlags::TYPE_1),
+    None,
+  )?;
+  let depth_memory = device.allocate_memory(
+    &vk::MemoryAllocateInfo::builder()
+      .allocation_size(device.get_image_memory_requirements(depth_image).size)
+      .memory_type_index(get_memory_type(
+        &instance,
+        phys_device,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+      )),
+    None,
+  )?;
+  device.bind_image_memory(depth_image, depth_memory, 0)?;
+  let depth_view = device.create_image_view(
+    &vk::ImageViewCreateInfo::builder()
+      .image(depth_image)
+      .view_type(vk::ImageViewType::TYPE_2D)
+      .format(vk::Format::D32_SFLOAT)
+      .subresource_range(
+        *vk::ImageSubresourceRange::builder()
+          .aspect_mask(vk::ImageAspectFlags::DEPTH)
+          .base_mip_level(0)
+          .level_count(1)
+          .base_array_layer(0)
+          .layer_count(1),
+      ),
+    None,
+  )?;
   let swapchain = swapchain_ext.create_swapchain(
     &vk::SwapchainCreateInfoKHR::builder()
       .surface(surface)
@@ -867,7 +1023,7 @@ unsafe fn create_swapchain(
         .create_framebuffer(
           &vk::FramebufferCreateInfo::builder()
             .render_pass(render_pass)
-            .attachments(&[*v])
+            .attachments(&[*v, depth_view])
             .width(extent.width)
             .height(extent.height)
             .layers(1),

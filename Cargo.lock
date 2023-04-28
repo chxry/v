@@ -153,7 +153,6 @@ dependencies = [
  "ash",
  "bitflags",
  "glfw-sys",
- "log",
  "objc",
  "raw-window-handle",
  "winapi",
